@@ -1326,40 +1326,63 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
 	return 0;
 }
 
+static inline void fuse_page_descs_length_init(struct fuse_req *req,
+		unsigned index, unsigned nr_pages)
+{
+	int i;
+
+	for (i = index; i < index + nr_pages; i++)
+		req->page_descs[i].length = PAGE_SIZE -
+			req->page_descs[i].offset;
+}
+
 static int fuse_readdir(struct file *file, struct dir_context *ctx)
 {
 	int plus, err;
 	size_t nbytes;
-	struct page *page;
+	struct page *pages = NULL;
 	struct inode *inode = file_inode(file);
 	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_req *req;
+	unsigned int max_pages_power_of_2 = 5;
+	unsigned int max_pages = 1 << max_pages_power_of_2;
+	unsigned int num_pages = 0;
+	int i;
 	u64 attr_version = 0;
 
 	if (is_bad_inode(inode))
 		return -EIO;
 
-	req = fuse_get_req(fc, 1);
-	if (IS_ERR(req))
-		return PTR_ERR(req);
+	/* make sure there are enough buffer pages and init request with them */
+	// TODO really reuse FUSE_MAX_PAGES_PER_REQ here?
+	if (max_pages > FUSE_MAX_PAGES_PER_REQ)
+		return -ENOMEM;
 
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		fuse_put_request(fc, req);
+	// TODO highmem correct? Like in `fuse_do_ioctl` or just GFP_KERNEL as it was before for the one page here in fuse_reverse_inval_entry
+	pages = alloc_pages(GFP_KERNEL | __GFP_HIGHMEM, max_pages_power_of_2);
+	if (!pages) {
 		return -ENOMEM;
 	}
+	num_pages = max_pages;
+
+	req = fuse_get_req(fc, num_pages);
+	if (IS_ERR(req)) {
+		__free_pages(pages, max_pages_power_of_2);
+		return PTR_ERR(req);
+	}
+	for (i = 0; i < num_pages; ++i)
+		req->pages[i] = &pages[i];
+	req->num_pages = num_pages;
+	fuse_page_descs_length_init(req, 0, req->num_pages);
 
 	plus = fuse_use_readdirplus(inode, ctx);
 	req->out.argpages = 1;
-	req->num_pages = 1;
-	req->pages[0] = page;
-	req->page_descs[0].length = PAGE_SIZE;
 	if (plus) {
 		attr_version = fuse_get_attr_version(fc);
-		fuse_read_fill(req, file, ctx->pos, PAGE_SIZE,
+		fuse_read_fill(req, file, ctx->pos, num_pages * PAGE_SIZE,
 			       FUSE_READDIRPLUS);
 	} else {
-		fuse_read_fill(req, file, ctx->pos, PAGE_SIZE,
+		fuse_read_fill(req, file, ctx->pos, num_pages * PAGE_SIZE,
 			       FUSE_READDIR);
 	}
 	fuse_lock_inode(inode);
@@ -1369,17 +1392,20 @@ static int fuse_readdir(struct file *file, struct dir_context *ctx)
 	err = req->out.h.error;
 	fuse_put_request(fc, req);
 	if (!err) {
+		// Important here: We can pass `page_address(pages[0])`
+		// only because `alloc_pages()` returns contiguous pages;
+		// `parse_dirplusfile()` and `parse_dirplusfile()` assume that.
 		if (plus) {
-			err = parse_dirplusfile(page_address(page), nbytes,
+			err = parse_dirplusfile(page_address(pages), nbytes,
 						file, ctx,
 						attr_version);
 		} else {
-			err = parse_dirfile(page_address(page), nbytes, file,
+			err = parse_dirfile(page_address(pages), nbytes, file,
 					    ctx);
 		}
 	}
 
-	__free_page(page);
+	__free_pages(pages, max_pages_power_of_2);
 	fuse_invalidate_atime(inode);
 	return err;
 }
